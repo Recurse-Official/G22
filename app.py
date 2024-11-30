@@ -1,125 +1,232 @@
-import requests
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
 import os
-from PyPDF2 import PdfReader
-from transformers import GPT2LMHeadModel, GPT2Tokenizer, Trainer, TrainingArguments
-from datasets import Dataset
-import json
-import pdfplumber
-# Step 1: Automate PDF Data Extraction
-# Function to download PDFs from a given URL
-def download_pdf(url, save_path):
-    response = requests.get(url)
-    with open(save_path, 'wb') as f:
-        f.write(response.content)
-    print(f"Downloaded PDF: {save_path}")
+from bson import ObjectId
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceBgeEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.llms import CTransformers
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from googletrans import Translator
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from nltk.corpus import stopwords
+import nltk
+from pymongo import MongoClient
+from dotenv import load_dotenv
+from datetime import datetime
+import logging
 
-# Function to extract text from PDF
-import pdfplumber
+nltk.download('stopwords')
 
-# Function to extract text from PDF using pdfplumber
-def extract_text_from_pdf(pdf_path):
-    text = ""
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            text += page.extract_text()
-    return text
-import pdfplumber
+app = Flask(_name_)
+CORS(app)
 
-# Function to extract text from PDF using pdfplumber
-def extract_text_from_pdf(pdf_path):
-    text = ""
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            text += page.extract_text()
-    return text
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = app.logger
+
+UPLOAD_FOLDER = 'uploads'
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10 MB limit
+
+# Load environment variables
+load_dotenv()
+
+# MongoDB setup
+mongodb_uri = "mongodb://localhost:27017"
+if not mongodb_uri:
+    raise ValueError("MONGODB_URI not found in environment variables")
+client = MongoClient(mongodb_uri)
+db = client["pdf_chat"]
+chat_sessions_collection = db["chat_sessions"]
+
+# Global variables to store processed data
+vector_store = None
+chain = None
+
+translator = Translator()
+
+def calculate_cosine_similarity(text, user_question):
+    stop_words = set(stopwords.words('english'))
+    vectorizer = TfidfVectorizer(stop_words=list(stop_words))
+    tfidf_matrix = vectorizer.fit_transform([text, user_question])
+    cos_similarity = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+    return cos_similarity
+
+def generate_pdf_title(text):
+    words = text.split()
+    return ' '.join(words[:5]) + "..."
+
+@app.route('/new_chat', methods=['POST'])
+def new_chat():
+    global vector_store, chain
+    logger.info('Received request for new chat')
+    if 'file' not in request.files:
+        logger.error('No file part in the request')
+        return jsonify({'error': 'No file part'}), 400
+    file = request.files['file']
+    if file.filename == '':
+        logger.error('No selected file')
+        return jsonify({'error': 'No selected file'}), 400
+
+    if file and file.filename.endswith('.pdf'):
+        try:
+            filename = secure_filename(file.filename)
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(filepath)
+            logger.info(f'File saved: {filepath}')
+
+            # Process the PDF
+            loader = PyPDFLoader(filepath)
+            documents = loader.load()
+            logger.info('PDF loaded')
+
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+            text_chunks = text_splitter.split_documents(documents)
+            logger.info('Text split into chunks')
+
+            embeddings = HuggingFaceBgeEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2", model_kwargs={'device': 'cpu'})
+            vector_store = FAISS.from_documents(text_chunks, embeddings)
+            logger.info('Vector store created')
+
+            llm = CTransformers(model=r"C:\Users\nakir\Downloads\mistral-7b-instruct-v0.1.Q4_K_M.gguf",
+                    config={'max_new_tokens': 500, 'temperature': 0.1})
+            
+            logger.info('Language model loaded')
+
+            memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+            chain = ConversationalRetrievalChain.from_llm(llm=llm, chain_type='stuff',
+                                                          retriever=vector_store.as_retriever(search_kwargs={"k": 2}),
+                                                          memory=memory)
+            logger.info('Conversational chain created')
+
+            # Generate a title for the PDF
+            pdf_title = generate_pdf_title(documents[0].page_content)
+
+            # Create a new chat session in MongoDB
+            chat_session = {
+                "pdf_title": pdf_title,
+                "questions_answers": [],
+                "created_at": datetime.now(),
+                "updated_at": datetime.now()
+            }
+            result = chat_sessions_collection.insert_one(chat_session)
+            chat_id = str(result.inserted_id)
+            logger.info(f'New chat session created with ID: {chat_id}')
+
+            return jsonify({'message': 'New chat created successfully', 'chat_id': chat_id, 'pdf_title': pdf_title}), 200
+        except Exception as e:
+            logger.error(f'Error processing PDF: {str(e)}')
+            return jsonify({'error': f'Error processing PDF: {str(e)}'}), 500
+    else:
+        logger.error('Invalid file type')
+        return jsonify({'error': 'Invalid file type. Please upload a PDF.'}), 400
 
 
 
-# Example URLs of PDFs 
-pdf_urls = ["https://content.dgft.gov.in/Website/CIEP.pdf", "https://content.dgft.gov.in/Website/TF.pdf","https://content.dgft.gov.in/Website/EI.pdf","https://content.dgft.gov.in/Website/GAE.pdf"]
-pdf_folder = "./pdfs"
-os.makedirs(pdf_folder, exist_ok=True)
 
-# Download and extract text from each PDF
-pdf_texts = []
-for url in pdf_urls:
-    pdf_name = os.path.join(pdf_folder, os.path.basename(url))
-    download_pdf(url, pdf_name)
-    text = extract_text_from_pdf(pdf_name)
-    pdf_texts.append(text)
 
-# Step 2: Fine-Tuning the GPT-2 Model on Extracted Data
-# Prepare dataset for fine-tuning (using the extracted PDF text)
-dataset = []
-for text in pdf_texts:
-    # Generate a sample question for the content
-    question = f" What is the main idea of this text? "
-    dataset.append({"prompt": text, "completion": question})
 
-# Save dataset in JSONL format for fine-tuning
-jsonl_file = "fine_tuning_dataset.jsonl"
-with open(jsonl_file, "w") as f:
-    for entry in dataset:
-        f.write(json.dumps(entry) + "\n")
+@app.route('/ask', methods=['POST'])
+def ask_question():
+    global chain, vector_store
+    logger.info('Received question request')
+    if not chain or not vector_store:
+        logger.error('No PDF processed yet')
+        return jsonify({'error': 'No PDF processed yet'}), 400
 
-# Step 3: Load Pre-trained GPT-2 Model and Tokenizer
-model_name = "gpt2"
-tokenizer = GPT2Tokenizer.from_pretrained(model_name)
-model = GPT2LMHeadModel.from_pretrained(model_name)
-tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-model.resize_token_embeddings(len(tokenizer))
-tokenizer.pad_token = tokenizer.eos_token 
-# Tokenize the dataset
-def tokenize_function(examples):
-    tokenized_inputs = tokenizer(examples['prompt'], truncation=True, padding="max_length", max_length=512)
-    # Add labels (same as input_ids for causal language modeling)
-    tokenized_inputs["labels"] = tokenized_inputs["input_ids"].copy()  
-    return tokenized_inputs
+    data = request.json
+    question = data.get('question')
+    language_code = data.get('language_code', 'en')
+    chat_id = data.get('chat_id')
 
-# Create a Hugging Face dataset from the JSONL file
-dataset = Dataset.from_json(jsonl_file)
+    if not question or not chat_id:
+        logger.error('No question or chat_id provided')
+        return jsonify({'error': 'No question or chat_id provided'}), 400
 
-# Apply tokenization to the dataset
-tokenized_dataset = dataset.map(tokenize_function, batched=True)
+    try:
+        logger.info(f'Processing question: {question}')
+        docs = vector_store.similarity_search(question, k=1)
 
-# Step 4: Fine-Tune the GPT-2 Model
-training_args = TrainingArguments(
-    output_dir="./results",  
-    eval_strategy="no",
-    learning_rate=2e-5,
-    per_device_train_batch_size=2,
-    num_train_epochs=3,
-    save_steps=10_000,
-    save_total_limit=2,
-)
+        if not docs or docs[0].page_content.strip() == "":
+            logger.info('Question not found in PDF')
+            answer = generate_general_answer(question)
+            answer = "Note: This answer is not based on the PDF content. " + answer
+        else:
+            similarity = calculate_cosine_similarity(docs[0].page_content, question)
+            logger.info(f'Similarity score: {similarity}')
 
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=tokenized_dataset,
-    #eval_dataset=eval_dataset 
-)
+            if similarity <= 0.0125:
+                logger.info('Question not directly related to PDF content')
+                answer = generate_general_answer(question)
+                answer = "Note: This answer may not be directly related to the PDF content. " + answer
+            else:
+                result = chain({"question": question})
+                answer = result["answer"]
+                logger.info('Answer generated from PDF content')
 
-# Fine-tune the model
-trainer.train()
+        translated_answer = translator.translate(answer, dest=language_code).text
+        logger.info(f'Answer translated to {language_code}')
 
-# Save the fine-tuned model
-trainer.save_model("./fine_tuned_gpt2")
+        #adding queation,answer pair to mongodb
+        chat_sessions_collection.update_one(
+            {"_id": ObjectId(chat_id)},
+            {
+                "$push": {"questions_answers": {"question": question, "answer": translated_answer}},
+                "$set": {"updated_at": datetime.now()}
+            }
+        )
+        logger.info('Q&A pair added to chat session')
 
-# Step 5: Generate Questions Using the Fine-Tuned Model
-# Load the fine-tuned model
-fine_tuned_model = GPT2LMHeadModel.from_pretrained("./fine_tuned_gpt2")
-fine_tuned_tokenizer = GPT2Tokenizer.from_pretrained("./fine_tuned_gpt2")
+        return jsonify({'answer': translated_answer}), 200
+    except Exception as e:
+        logger.error(f'Error processing question: {str(e)}')
+        return jsonify({'error': f'Error processing question: {str(e)}'}), 500
 
-# Function to generate questions from extracted text
-def generate_question(text):
-    input_ids = fine_tuned_tokenizer.encode(text, return_tensors="pt")
-    
-    output = fine_tuned_model.generate(input_ids, max_new_tokens=100, num_return_sequences=1)  
-    question = fine_tuned_tokenizer.decode(output[0], skip_special_tokens=True)
-    return question
+def generate_general_answer(question):
+    # Use a more direct prompt to get a helpful answer
+    prompt = f"Please provide a helpful and informative answer to the following question, based on your general knowledge: {question}"
+    result = chain({"question": prompt})
+    return result["answer"]
 
-# Test question generation from a sample PDF content
-sample_text = pdf_texts[0]  # Using the first PDF's extracted text
-generated_question = generate_question(sample_text)
-print(f"Generated Question: {generated_question}")
+
+
+
+@app.route('/chat_sessions', methods=['GET'])
+def get_chat_sessions():
+    logger.info('Fetching chat sessions')
+    try:
+        sessions = list(chat_sessions_collection.find())
+        for session in sessions:
+            session['_id'] = str(session['_id'])  # Convert ObjectId to string
+        logger.info(f'Retrieved {len(sessions)} chat sessions')
+        return jsonify(sessions)
+    except Exception as e:
+        logger.error(f'Error fetching chat sessions: {str(e)}')
+        return jsonify({"error": "Failed to fetch chat sessions"}), 500
+
+@app.route('/chat_history/<chat_id>', methods=['GET'])
+def get_chat_history(chat_id):
+    logger.info(f'Fetching chat history for chat ID: {chat_id}')
+    try:
+        chat_session = chat_sessions_collection.find_one({"_id": ObjectId(chat_id)})
+        if chat_session:
+            chat_session['_id'] = str(chat_session['_id'])
+            logger.info('Chat history retrieved successfully')
+            return jsonify(chat_session)
+        else:
+            logger.warning(f'Chat session not found for ID: {chat_id}')
+            return jsonify({"error": "Chat session not found"}), 404
+    except Exception as e:
+        logger.error(f'Error retrieving chat history: {str(e)}')
+        return jsonify({"error": "Failed to retrieve chat history"}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True, use_reloader=False)
